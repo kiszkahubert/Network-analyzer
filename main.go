@@ -1,12 +1,15 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"text/tabwriter"
 	"time"
 
 	"github.com/google/gopacket"
@@ -266,12 +269,103 @@ func startProcessScanner() {
 		}
 	}()
 }
+func formatBytes(bytes uint64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	div, exp := uint64(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMG"[exp])
+}
+func displayStats() {
+	ticker := time.NewTicker(1 * time.Second)
+	for range ticker.C {
+		connectionsMutex.RLock()
+		processMutex.RLock()
+		var rows []struct {
+			Process  string
+			Port     uint16
+			Protocol string
+			RemoteIP string
+			DownRate uint64
+			UpRate   uint64
+		}
+		for meta, history := range activeConnections {
+			history.mu.Lock()
+			var totalDown, totalUp uint64
+			for _, stats := range history.History {
+				totalDown += stats.DownloadBytes
+				totalUp += stats.UploadBytes
+			}
+			history.mu.Unlock()
+			avgDown := totalDown / 10
+			avgUp := totalUp / 10
+			if avgDown == 0 && avgUp == 0 {
+				continue
+			}
+			procName := portToProcessMap[meta.LocalPort]
+			if procName == "" {
+				procName = "unknown"
+			}
+			rows = append(rows, struct {
+				Process  string
+				Port     uint16
+				Protocol string
+				RemoteIP string
+				DownRate uint64
+				UpRate   uint64
+			}{
+				Process:  procName,
+				Port:     meta.LocalPort,
+				Protocol: meta.Protocol,
+				RemoteIP: meta.RemoteIP,
+				DownRate: avgDown,
+				UpRate:   avgUp,
+			})
+		}
+		processMutex.RUnlock()
+		connectionsMutex.RUnlock()
+		sort.Slice(rows, func(i, j int) bool {
+			iUnknown := rows[i].Process == "unknown"
+			jUnknown := rows[j].Process == "unknown"
+			if iUnknown != jUnknown {
+				return !iUnknown
+			}
+			if rows[i].Process != rows[j].Process {
+				return rows[i].Process < rows[j].Process
+			}
+			return rows[i].DownRate > rows[j].DownRate
+		})
+		var buf strings.Builder
+		w := tabwriter.NewWriter(&buf, 0, 0, 3, ' ', 0)
+		fmt.Fprintln(w, "PROCESS\tL.PORT\tPROTO\tREMOTE IP\tDOWNLOAD (avg/s)\tUPLOAD (avg/s)")
+		fmt.Fprintln(w, "-------\t------\t-----\t---------\t----------------\t--------------")
+		for _, row := range rows {
+			fmt.Fprintf(w, "%s\t%d\t%s\t%s\t%s\t%s\n",
+				row.Process,
+				row.Port,
+				row.Protocol,
+				row.RemoteIP,
+				formatBytes(row.DownRate),
+				formatBytes(row.UpRate),
+			)
+		}
+		w.Flush()
+		fmt.Print("\033[H\033[0J")
+		fmt.Print(buf.String())
+	}
+}
 func main() {
 	interfaces, err := GetNetworkInterfaces()
 	if err != nil {
-		return
+		log.Fatal(err)
 	}
 	startProcessScanner()
 	startStatsTicker()
-	CapturePackets(interfaces[0])
+	go CapturePackets(interfaces[0])
+	displayStats()
 }
